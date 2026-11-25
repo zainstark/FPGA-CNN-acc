@@ -255,17 +255,120 @@ From a clean checkout:
 
 The checked-in Yosys log reports Yosys 0.66. No simulator or nextpnr version is specified by the project files.
 
-## Project Status
+# Evaluation Results (Baseline, Pre-Optimization)
 
-The baseline RTL is implemented and functionally verified by the supplied full-system and module-level simulations. Yosys synthesis and ECP5 place-and-route artifacts are present. The checked-in ECP5 implementation reaches 66.65 MHz against a 100 MHz target, so the recorded timing result does not meet that target.
+## Tools and method
+- Simulation: Icarus Verilog 13.0 (cycle-accurate, exact numbers)
+- Lint: Verilator 5.054 (0 errors, style warnings only)
+- Synthesis estimates: Yosys 0.66 (generic LUT4 mapping)
+- Quartus was not available, so Fmax, DSP and power are **estimates or proxies**, not Quartus reports
+- Reproduce everything with `make all`. The bundled output is `reports/ALL_RESULTS.txt`
 
-## Known Limitations / TODO
+## Functional verification
+- 15 test cases: checkerboard, constant ±, max pixels, max ± kernel, mixed-sign kernel, positive/negative kernel, saturation ±, signed edge values, Sobel-X, random, zero
+- Nominal mode (`output_ready=1`): **15/15 PASS**
+- Random output backpressure: **15/15 PASS**
+- Accepted pixels per frame: **1024**
+- Output pixels per frame: **900** (30×30)
+- Mismatches vs Python golden model: **0** in every case
+- Backpressure stability errors: **0** (276 stall cycles per frame)
+- `done` never fires before the last output is delivered
 
-- `adder_tree.v` is explicitly implemented for nine products; arbitrary `N` values are not supported by the complete datapath despite parameterized module interfaces.
-- The line-buffer row counter reuses the `IMAGE_WIDTH` address width and assumes the image height fits that width, as documented in the RTL.
-- Regenerated vectors are written under `py_golden/test_vectors/`, while `conv_tb.v` expects root-level `test_vectors/`.
-- No nextpnr invocation script, power report, latency/throughput measurement, or formal-verification flow is checked in.
-- The design specification names an Intel MAX 10 target, but the available synthesis and implementation artifacts are for Lattice ECP5.
+## Latency and throughput (exact, cycle counts)
+- Pipeline latency (pixel (2,2) accepted → first output): **5 cycles**
+- Start → first output: 73 cycles
+- Start → last output: **1030 cycles**
+- Frame latency (start → `done`): **1032 cycles**
+- Frame latency under random backpressure: 1434 cycles
+- Output rate: **0.874 outputs/cycle** (900 / 1030)
+- Input rate: **0.994 pixels/cycle** (1024 / 1030)
+- Compute rate: **7.86 MAC/cycle** (9 × 900 / 1030)
+- Outputs are fewer than inputs because VALID padding drops the border
+
+| Assumed clock | 50 MHz | 60 MHz | 72 MHz |
+|---|---|---|---|
+| Frame latency | 20.6 µs | 17.2 µs | 14.3 µs |
+| Pipeline latency | 100 ns | 83 ns | 69 ns |
+| Frames/s | 48.5 k | 58.1 k | 69.8 k |
+| Output rate | 43.7 MOut/s | 52.4 MOut/s | 62.9 MOut/s |
+| MAC rate | 0.39 GMAC/s | 0.47 GMAC/s | 0.57 GMAC/s |
+
+## Resource usage (Yosys, LUT4 mapping)
+
+| Module | LUT4 | FF |
+|---|---|---|
+| multiplier ×9 | 1467 | 0 |
+| adder_tree | 271 | 0 |
+| mac_unit (registers) | 0 | 21 |
+| line_buffer | 514 | 563 |
+| window_generator | 2 | 121 |
+| output_stage | 19 | 17 |
+| control_fsm | 18 | 6 |
+| conv_top (kernel regs, output queue, counters) | 152 | 225 |
+| **Total (hierarchical)** | **2443** | **953** |
+| **Total (flattened, headline)** | **2449** | **947** |
+
+- Multipliers use about 60% of the LUTs, and the line buffer uses about 59% of the FFs
+- Estimated LE usage on the 10M50: about 5–7% of 49,760
+- **BRAM: 0.** The line buffer (512 bits) uses an asynchronous read, so it was built from FFs. The 8×16 output queue was also built from registers
+- **DSP: 0 measured.** Yosys has no MAX 10 DSP mapping. The RTL has nine 9×8 signed multipliers, which would use **9 of the 288 embedded 9×9 multipliers** (about 5 DSP blocks if paired) in Quartus
+
+| Variant | LUT | FF | DSP (9×9) | M9K |
+|---|---|---|---|---|
+| As built (measured) | 2449 | 947 | 0 | 0 |
+| DSP multipliers (estimate) | about 980 | 947 | 9 | 0 |
+| DSP multipliers + M9K line buffer (estimate) | about 480 | about 435 | 9 | 1 |
+
+## Timing (estimate, not static timing analysis)
+- Longest combinational path (Yosys `ltp`, LUT4 levels):
+  - **conv_top / mac_unit: 19 levels** (window_out → multiplier → adder tree → result_out)
+  - adder_tree: 15
+  - multiplier: 11
+  - line_buffer: 6
+  - control_fsm: 3
+  - output_stage and window_generator: 2
+- Assuming 0.7–1.0 ns per level plus about 0.6 ns clock-to-Q and setup, the period is 14–20 ns
+- **Estimated Fmax: about 50–72 MHz (mid ≈ 60 MHz)** for the LUT-multiplier build
+- Critical path: the MAC stage, with a single register after the whole multiply and add
+- The estimate ignores carry chains, so real Quartus numbers may be better
+- Proposed improvement: add a pipeline register between multipliers and adder tree. That should split the path to about 11 and 8 levels, raise Fmax by about 1.5×, and cost 1 cycle of latency and about 144 FFs
+
+## Power proxy (switching activity, random image, 1077 cycles)
+- Total bit toggles per cycle: **504** (includes testbench signals)
+- Toggles per bit per cycle:
+
+| Block | Activity |
+|---|---|
+| window_generator | 0.257 |
+| adder_tree | 0.256 |
+| mac_unit | 0.194 |
+| output_stage | 0.104 |
+| line_buffer | 0.087 (undercounted) |
+| control_fsm | 0.013 |
+
+- Most active nets: `products` (47.6 toggles/cycle) and the window (31.8 toggles/cycle)
+- Multipliers and the adder tree dominate dynamic power, which supports moving the multipliers to DSP blocks
+- The VCD does not include memory arrays (`buf_mem`, `kernel_mem`, `outq_mem`), so line-buffer activity is understated
+- This is a relative measure only, not milliwatts
+
+## Figure of merit
+- Formula: FoM = output throughput (MOut/s) / (LUT + FF + 100 × DSP), at an assumed 60 MHz (52.4 MOut/s)
+- LUT-multiplier build (measured): 52.4 / 3396 = **0.0154**
+- DSP-multiplier build (estimate): 52.4 / 2827 = **0.0185**
+
+## Fixed-point analysis
+- Multiplier: 9-bit signed pixel (zero-extended from unsigned 8-bit) × 8-bit signed coefficient
+- Worst-case product: 255 × (−128) = −32,640, which fits in 16-bit signed
+- Worst-case sum: +291,465 and −293,760, which fits in the 20-bit signed accumulator (±524,287), so the accumulator never overflows
+- Output saturates to 32,767 / −32,768, and the saturation test cases pass with 0 mismatches
+
+## Known limitations
+- Fmax, DSP count and power are estimates, pending Quartus synthesis
+- `synth_intel` failed on Yosys 0.66, so the LUT4 results are used instead
+- FSM outputs `buffer_enable`, `compute_enable`, `output_enable` and `kernel_load_enable` are not connected to the datapath. The FSM only provides `busy`, `done` and drain sequencing
+- `kernel_addr` accepts values 9–15, which map to unused kernel memory entries
+- The line buffer uses asynchronous reads, so it maps to FFs and not M9K block RAM
+
 
 ## License
 
