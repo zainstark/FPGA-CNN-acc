@@ -373,7 +373,3 @@ The checked-in Yosys log reports Yosys 0.66. No simulator or nextpnr version is 
 ## License
 
 No license is currently specified in the repository.
-
-## Inspected Repository Sources
-
-This README was constructed from the root files, all RTL modules in `rtl/`, all supplied testbenches in `tb/`, the Python files in `py_golden/`, the checked-in vector layout, `syn/run_synth.sh`, `syn/synth.ys`, the reports under `reports/`, and the documentation files under `Docs/`.
